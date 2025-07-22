@@ -1,0 +1,26 @@
+# Core utilities
+python-dotenv
+
+
+# LangChain and its extensions
+langchain>=0.3.26
+langchain-groq
+
+
+# LLMs
+groq
+
+# ML backends
+numpy
+pandas
+
+# graph
+langgraph
+
+# Image
+IPython
+grandalf
+
+# Portfolio Optimization
+yfinance
+PyPortfolioOpt
