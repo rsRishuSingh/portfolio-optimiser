@@ -13,6 +13,8 @@ groq
 # ML backends
 numpy
 pandas
+matplotlib
+tensorflow
 
 # graph
 langgraph
