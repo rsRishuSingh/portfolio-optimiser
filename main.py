@@ -48,8 +48,17 @@ ef_act  = EfficientFrontier(mean_act,  cov_act)
 # Sharpe-optimal weights (for reference)
 w_pred_sharpe = ef_pred.max_sharpe()
 w_act_sharpe  = ef_act.max_sharpe()
+
 print("Predicted Sharpe Weights:", ef_pred.clean_weights())
 print("Actual Sharpe Weights:   ", ef_act.clean_weights())
+
+# Portfolio performance: expected return, volatility, Sharpe ratio
+ret_pred, vol_pred, sharpe_pred = ef_pred.portfolio_performance()
+ret_act, vol_act, sharpe_act = ef_act.portfolio_performance()
+
+# Print Sharpe ratios
+print(f"Predicted Max Sharpe Ratio: {sharpe_pred:.4f}")
+print(f"Actual Max Sharpe Ratio:    {sharpe_act:.4f}")
 
 
 def optimize_for_risk_capacity(ef: EfficientFrontier, target_vol: float):
