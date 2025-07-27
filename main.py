@@ -20,195 +20,90 @@ folder_path = 'Predicted_performance'
 
 llm = ChatGroq(model=MODEL_NAME)
 
-
 def load_returns():
-    """
-    Load CSV files from a folder and compute actual and predicted returns.
-
-    Each CSV should have columns: Date, Actual, Predicted.
-    Filenames should be like SYMBOL_YYYY_predictions.csv (e.g., AAPL_2024_predictions.csv).
-
-    Returns:
-        actual_df (pd.DataFrame): DataFrame indexed by Date, with one column per symbol of actual returns.
-        pred_df   (pd.DataFrame): DataFrame indexed by Date, with one column per symbol of predicted returns.
-    """
-    actual_dfs = []
-    pred_dfs   = []
-
+    actual_dfs, pred_dfs = [], []
     for filename in sorted(os.listdir(folder_path)):
         if not filename.lower().endswith('.csv'):
             continue
-
         symbol = filename.split('_')[0].lower()
-        path   = os.path.join(folder_path, filename)
-
-        df = pd.read_csv(path, parse_dates=['Date'])
-        df = df.sort_values('Date')
-
+        df = pd.read_csv(os.path.join(folder_path, filename), parse_dates=['Date']).sort_values('Date')
         actual_dfs.append(df[['Date', 'Actual']].rename(columns={'Actual': symbol}))
-        pred_dfs.append(  df[['Date', 'Predicted']].rename(columns={'Predicted': symbol}))
-
+        pred_dfs.append(df[['Date', 'Predicted']].rename(columns={'Predicted': symbol}))
     def merge_on_date(dfs):
         return reduce(lambda L, R: pd.merge(L, R, on='Date', how='outer'), dfs)
-
-    # Merge all symbol‐level DataFrames
-    actual_df = merge_on_date(actual_dfs) if actual_dfs else pd.DataFrame()
-    pred_df   = merge_on_date(pred_dfs)   if pred_dfs   else pd.DataFrame()
-
-    # Sort by date and then set Date as the index
-    actual_df = (actual_df
-                 .sort_values('Date')
-                 .set_index('Date'))
-    pred_df   = (pred_df
-                 .sort_values('Date')
-                 .set_index('Date'))
-
+    actual_df = merge_on_date(actual_dfs).sort_values('Date').set_index('Date') if actual_dfs else pd.DataFrame()
+    pred_df   = merge_on_date(pred_dfs).sort_values('Date').set_index('Date')   if pred_dfs   else pd.DataFrame()
     return actual_df, pred_df
 
 actual_df, pred_df = load_returns()
-print(actual_df.head())
-print(pred_df.head())
 
-meanPredicted = expected_returns.mean_historical_return(pred_df) #expected returns
-covariancePredicted = risk_models.sample_cov(pred_df) #Covariance matrix
+mean_pred = expected_returns.mean_historical_return(pred_df)
+cov_pred = risk_models.sample_cov(pred_df)
+mean_act  = expected_returns.mean_historical_return(actual_df)
+cov_act  = risk_models.sample_cov(actual_df)
 
-# Providing expected returns and covariance matrix as input\
-ef_Predicted = EfficientFrontier(meanPredicted, covariancePredicted)
-# Optimizing weights for Sharpe ratio maximization 
-weights_Predicted = ef_Predicted.max_sharpe()
-# clean_weights rounds the weights and clips near-zeros
-clean_weights_Predicted = ef_Predicted.clean_weights() 
-print("Expected : ",clean_weights_Predicted)
+ef_pred = EfficientFrontier(mean_pred, cov_pred)
+ef_act  = EfficientFrontier(mean_act,  cov_act)
 
-
-meanActual = expected_returns.mean_historical_return(actual_df)
-covarianceActual = risk_models.sample_cov(actual_df) 
-
-ef_Actual = EfficientFrontier(meanActual, covarianceActual)
-weights_Actual = ef_Actual.max_sharpe()
-clean_weights_Actual = ef_Actual.clean_weights() 
-print("Actual : ",clean_weights_Actual)
+# Sharpe-optimal weights (for reference)
+w_pred_sharpe = ef_pred.max_sharpe()
+w_act_sharpe  = ef_act.max_sharpe()
+print("Predicted Sharpe Weights:", ef_pred.clean_weights())
+print("Actual Sharpe Weights:   ", ef_act.clean_weights())
 
 
-def plot_all_price_comparison(actual_df, pred_df):
+def optimize_for_risk_capacity(ef: EfficientFrontier, target_vol: float):
     """
-    Plot all tickers on a single graph:
-      – Actual prices as dotted lines
-      – Predicted prices as solid lines
-    Each ticker shares a unique color.
-    """
-    # pull default color cycle
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    for idx, ticker in enumerate(actual_df.columns):
-        color = colors[idx % len(colors)]
-        
-        # actual dotted
-        ax.plot(
-            actual_df.index, actual_df[ticker],
-            linestyle=':', linewidth=1.5, color=color,
-            label=f"{ticker.upper()} Actual"
-        )
-        # predicted solid
-        ax.plot(
-            pred_df.index, pred_df[ticker],
-            linestyle='-', linewidth=1.5, color=color,
-            label=f"{ticker.upper()} Predicted"
-        )
-    
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.set_title("Actual vs Predicted Prices for All Tickers")
-    ax.legend(ncol=2, fontsize='small')
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    plt.show()
-
-
-plot_all_price_comparison(actual_df, pred_df)
-
-
-def compute_weighted_portfolio_returns(returns_df, weights):
-    """
-    Compute portfolio daily returns given asset returns and weights.
-
-    Parameters:
-    -----------
-    returns_df : pd.DataFrame
-        DataFrame indexed by Date, columns are asset symbols, values are daily returns.
-    weights : dict or list or np.ndarray
-        If dict: {symbol: weight, ...}
-        If list/array: weights aligned in order of returns_df.columns.
-
+    Optimize portfolio to maximize return for a given risk (volatility).
     Returns:
-    --------
-    pd.DataFrame
-        Single-column DataFrame (column name 'Portfolio') of weighted portfolio returns.
+      weights     : dict of asset weights
+      exp_return  : expected annual return
+      exp_vol     : expected annual volatility
+      sharpe      : Sharpe ratio
     """
+    # Set target volatility (annualized)
+    ef.efficient_risk(target_vol)
 
-    # Align weights to columns
-    if isinstance(weights, (list, np.ndarray)):
-        weights_series = pd.Series(weights, index=returns_df.columns)
-    else:
-        weights_series = pd.Series(weights)
+    # Clean (round) weights
+    cleaned = ef.clean_weights()
 
-    # Multiply each column by its weight, then sum across columns
-    port_ret = returns_df.mul(weights_series, axis=1).sum(axis=1)
+    # Compute performance metrics
+    exp_ret, exp_vol, sharpe = ef.portfolio_performance()
+    return cleaned, exp_ret, exp_vol, sharpe
 
-    return port_ret.to_frame(name='Portfolio')
+# Prompt user and handle inputs robustly
+def prompt_risk_capacity():
+    while True:
+        raw = input("Enter your risk capacity (annual volatility, e.g. 0.12 for 12% or 12 for 12%): ")
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Invalid format. Please enter a number (e.g., 0.10 or 10).")
+            continue
+        # Normalize percentage inputs >= 1
+        if value >= 1:
+            value = value / 100.0
+        # Check bounds
+        if not (0 < value < 1):
+            print("Please enter a volatility between 0 and 1 (e.g., 0.15 for 15%).")
+            continue
+        return value
 
+# Get user risk target
+risk_capacity = prompt_risk_capacity()
 
-def compute_actual_and_predicted_portfolios(actual_df, pred_df, actual_weights, pred_weights):
-    """
-    Given actual & predicted returns DataFrames and a weight allocation,
-    return two DataFrames of portfolio returns.
+# Optimize predicted portfolio for that risk
+try:
+    w_pred_risk, ret_pred_risk, vol_pred_risk, sr_pred_risk = optimize_for_risk_capacity(
+        EfficientFrontier(mean_pred, cov_pred),
+        risk_capacity
+    )
+    print(f"\nPredicted Portfolio for target {risk_capacity*100:.2f}% vol:")
+    print("Weights:          ", w_pred_risk)
+    print(f"Expected Return:  {ret_pred_risk*100:.2f}%")
+    print(f"Expected Volatility: {vol_pred_risk*100:.2f}%")
+    print(f"Sharpe Ratio:     {sr_pred_risk:.2f}")
+except Exception as e:
+    print(f"Optimization error – could not achieve target volatility {risk_capacity*100:.2f}%: {e}")
 
-    Parameters:
-    -----------
-    actual_df : pd.DataFrame
-        Daily actual returns.
-    pred_df : pd.DataFrame
-        Daily predicted returns.
-    weights : dict or list or np.ndarray
-        Portfolio weights per asset.
-
-    Returns:
-    --------
-    (actual_port_df, pred_port_df)
-    Each is a DataFrame with index Date and column 'Portfolio'.
-    """
-    actual_port = compute_weighted_portfolio_returns(actual_df, actual_weights)
-    pred_port   = compute_weighted_portfolio_returns(pred_df,   pred_weights)
-    return actual_port, pred_port
-
-
-actual_port, pred_port  = compute_actual_and_predicted_portfolios(actual_df, pred_df,clean_weights_Actual,clean_weights_Predicted )
-
-print(actual_port.head())
-print(pred_port.head())
-
-
-def plot_portfolio_returns(port_actual, port_predicted):
-    """
-    Plot the actual and predicted portfolio returns over time.
-
-    Args:
-        port_actual (pd.DataFrame): DataFrame with Date index and one column 'Portfolio' for actual returns.
-        port_predicted (pd.DataFrame): DataFrame with Date index and one column 'Portfolio' for predicted returns.
-    """
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(port_actual.index, port_actual['Portfolio'], label='Actual Portfolio Return', linestyle='--', color='blue')
-    plt.plot(port_predicted.index, port_predicted['Portfolio'], label='Predicted Portfolio Return', linestyle='-', color='orange')
-
-    plt.xlabel('Date')
-    plt.ylabel('Return')
-    plt.title('Actual vs Predicted Portfolio Returns')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-plot_portfolio_returns(actual_port, pred_port)
+# You can repeat the above for actual data by swapping in (mean_act, cov_act) to EfficientFrontier
