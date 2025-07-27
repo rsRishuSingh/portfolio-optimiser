@@ -1,19 +1,14 @@
 import os
 import json
-from typing import List, TypedDict, Annotated, Sequence
-
+from functools import reduce
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
-
-from utility import append_to_response, remove_think, get_context
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+import matplotlib.pyplot as plt
+from utility import remove_think
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_groq import ChatGroq
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages
 
 # Portfolio optimization imports
 from pypfopt.efficient_frontier import EfficientFrontier
@@ -21,87 +16,199 @@ from pypfopt import risk_models, expected_returns
 
 load_dotenv()
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3-32b")
+folder_path = 'Predicted_performance'
 
 llm = ChatGroq(model=MODEL_NAME)
 
 
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-
-# TOOL: Sharpe Ratio
-@tool
-def sharpe_ratio(returns: List[float], risk_free_rate: float = 0.0) -> float:
-    arr = np.array(returns, dtype=float)
-    excess = arr - risk_free_rate
-    if arr.size < 2 or np.std(excess, ddof=1) == 0:
-        raise ValueError("Insufficient data or zero volatility for Sharpe Ratio.")
-    return float(np.mean(excess) / np.std(excess, ddof=1))
-
-# Get historical data
-@tool
-def get_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
+def load_returns():
     """
-    Download adjusted close prices for the given tickers and date range.
-    Returns a DataFrame with each column named by ticker.
+    Load CSV files from a folder and compute actual and predicted returns.
+
+    Each CSV should have columns: Date, Actual, Predicted.
+    Filenames should be like SYMBOL_YYYY_predictions.csv (e.g., AAPL_2024_predictions.csv).
+
+    Returns:
+        actual_df (pd.DataFrame): DataFrame indexed by Date, with one column per symbol of actual returns.
+        pred_df   (pd.DataFrame): DataFrame indexed by Date, with one column per symbol of predicted returns.
     """
-    data_frames = []
-    for ticker in tickers:
-        df = yf.download(ticker, start=start, end=end, progress=False)["Adj Close"].rename(ticker)
-        data_frames.append(df)
-    # Concatenate on date index
-    result = pd.concat(data_frames, axis=1)
-    return result
+    actual_dfs = []
+    pred_dfs   = []
 
-# -------------------------------------------------------------------
-# AGENT NODE: Input Query
-# -------------------------------------------------------------------
-def input_query(state: AgentState) -> AgentState:
-    state["messages"] = []
-    user_input = input("🤖 Enter your portfolio details (tickers, date range, risk tolerance):\nUser: ")
-    query = HumanMessage(content=user_input)
-    append_to_response([{"input_query": query}], filename="agent_log.json")
-    return {"messages": [query]}
+    for filename in sorted(os.listdir(folder_path)):
+        if not filename.lower().endswith('.csv'):
+            continue
 
-# -------------------------------------------------------------------
-# AGENT NODE: Fetch Data
-# -------------------------------------------------------------------
-def fetch_data_agent(state: AgentState) -> AgentState:
-    # Extract tickers and dates from last human message
-    last_msg = state["messages"][-1].content
-    # Here you'd parse out tickers, start, end; for example assume JSON
-    params = json.loads(last_msg)
-    tickers = params.get("tickers", [])
-    start = params.get("start")
-    end = params.get("end")
-    df = get_data(tickers, start, end)
-    append_to_response([{"fetched_data_head": df.head().to_dict()}], filename="agent_log.json")
-    # Store DataFrame in context (not displayed directly)
-    return {"messages": [AIMessage(content="Data fetched successfully."), df]}
+        symbol = filename.split('_')[0].lower()
+        path   = os.path.join(folder_path, filename)
 
-# -------------------------------------------------------------------
-# AGENT NODE: Calculate Weights
-# -------------------------------------------------------------------
-def calculate_frontliner(state: AgentState) -> AgentState:
-    # Assume df is stored as second message
-    df = state["messages"][1]
-    # Calculate returns and risk/returns
-    mu = expected_returns.mean_historical_return(df)
-    S = risk_models.sample_cov(df)
-    ef = EfficientFrontier(mu, S)
-    raw_weights = ef.max_sharpe()
-    clean_weights = ef.clean_weights()
-    append_to_response([{"optimized_weights": clean_weights}], filename="agent_log.json")
-    return {"messages": [AIMessage(content=json.dumps(clean_weights))]}
+        df = pd.read_csv(path, parse_dates=['Date'])
+        df = df.sort_values('Date')
 
-# -------------------------------------------------------------------
-# AGENT NODE: Return Predictor
-# -------------------------------------------------------------------
-def return_predictor(state: AgentState) -> AgentState:
-    # Uses earlier predicted returns (from a forecasting tool) in context
-    forecast = state.get("forecasted_returns")
-    if not forecast:
-        raise ValueError("Forecasted returns not found in state.")
-    # Reconstruct price series and output
-    output = {"forecasted_returns": forecast}
-    append_to_response([{"final_output": output}], filename="agent_log.json")
-    return {"messages": [AIMessage(content=json.dumps(output))]}
+        actual_dfs.append(df[['Date', 'Actual']].rename(columns={'Actual': symbol}))
+        pred_dfs.append(  df[['Date', 'Predicted']].rename(columns={'Predicted': symbol}))
+
+    def merge_on_date(dfs):
+        return reduce(lambda L, R: pd.merge(L, R, on='Date', how='outer'), dfs)
+
+    # Merge all symbol‐level DataFrames
+    actual_df = merge_on_date(actual_dfs) if actual_dfs else pd.DataFrame()
+    pred_df   = merge_on_date(pred_dfs)   if pred_dfs   else pd.DataFrame()
+
+    # Sort by date and then set Date as the index
+    actual_df = (actual_df
+                 .sort_values('Date')
+                 .set_index('Date'))
+    pred_df   = (pred_df
+                 .sort_values('Date')
+                 .set_index('Date'))
+
+    return actual_df, pred_df
+
+actual_df, pred_df = load_returns()
+print(actual_df.head())
+print(pred_df.head())
+
+meanPredicted = expected_returns.mean_historical_return(pred_df) #expected returns
+covariancePredicted = risk_models.sample_cov(pred_df) #Covariance matrix
+
+# Providing expected returns and covariance matrix as input\
+ef_Predicted = EfficientFrontier(meanPredicted, covariancePredicted)
+# Optimizing weights for Sharpe ratio maximization 
+weights_Predicted = ef_Predicted.max_sharpe()
+# clean_weights rounds the weights and clips near-zeros
+clean_weights_Predicted = ef_Predicted.clean_weights() 
+print("Expected : ",clean_weights_Predicted)
+
+
+meanActual = expected_returns.mean_historical_return(actual_df)
+covarianceActual = risk_models.sample_cov(actual_df) 
+
+ef_Actual = EfficientFrontier(meanActual, covarianceActual)
+weights_Actual = ef_Actual.max_sharpe()
+clean_weights_Actual = ef_Actual.clean_weights() 
+print("Actual : ",clean_weights_Actual)
+
+
+def plot_all_price_comparison(actual_df, pred_df):
+    """
+    Plot all tickers on a single graph:
+      – Actual prices as dotted lines
+      – Predicted prices as solid lines
+    Each ticker shares a unique color.
+    """
+    # pull default color cycle
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    for idx, ticker in enumerate(actual_df.columns):
+        color = colors[idx % len(colors)]
+        
+        # actual dotted
+        ax.plot(
+            actual_df.index, actual_df[ticker],
+            linestyle=':', linewidth=1.5, color=color,
+            label=f"{ticker.upper()} Actual"
+        )
+        # predicted solid
+        ax.plot(
+            pred_df.index, pred_df[ticker],
+            linestyle='-', linewidth=1.5, color=color,
+            label=f"{ticker.upper()} Predicted"
+        )
+    
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.set_title("Actual vs Predicted Prices for All Tickers")
+    ax.legend(ncol=2, fontsize='small')
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+
+plot_all_price_comparison(actual_df, pred_df)
+
+
+def compute_weighted_portfolio_returns(returns_df, weights):
+    """
+    Compute portfolio daily returns given asset returns and weights.
+
+    Parameters:
+    -----------
+    returns_df : pd.DataFrame
+        DataFrame indexed by Date, columns are asset symbols, values are daily returns.
+    weights : dict or list or np.ndarray
+        If dict: {symbol: weight, ...}
+        If list/array: weights aligned in order of returns_df.columns.
+
+    Returns:
+    --------
+    pd.DataFrame
+        Single-column DataFrame (column name 'Portfolio') of weighted portfolio returns.
+    """
+
+    # Align weights to columns
+    if isinstance(weights, (list, np.ndarray)):
+        weights_series = pd.Series(weights, index=returns_df.columns)
+    else:
+        weights_series = pd.Series(weights)
+
+    # Multiply each column by its weight, then sum across columns
+    port_ret = returns_df.mul(weights_series, axis=1).sum(axis=1)
+
+    return port_ret.to_frame(name='Portfolio')
+
+
+def compute_actual_and_predicted_portfolios(actual_df, pred_df, actual_weights, pred_weights):
+    """
+    Given actual & predicted returns DataFrames and a weight allocation,
+    return two DataFrames of portfolio returns.
+
+    Parameters:
+    -----------
+    actual_df : pd.DataFrame
+        Daily actual returns.
+    pred_df : pd.DataFrame
+        Daily predicted returns.
+    weights : dict or list or np.ndarray
+        Portfolio weights per asset.
+
+    Returns:
+    --------
+    (actual_port_df, pred_port_df)
+    Each is a DataFrame with index Date and column 'Portfolio'.
+    """
+    actual_port = compute_weighted_portfolio_returns(actual_df, actual_weights)
+    pred_port   = compute_weighted_portfolio_returns(pred_df,   pred_weights)
+    return actual_port, pred_port
+
+
+actual_port, pred_port  = compute_actual_and_predicted_portfolios(actual_df, pred_df,clean_weights_Actual,clean_weights_Predicted )
+
+print(actual_port.head())
+print(pred_port.head())
+
+
+def plot_portfolio_returns(port_actual, port_predicted):
+    """
+    Plot the actual and predicted portfolio returns over time.
+
+    Args:
+        port_actual (pd.DataFrame): DataFrame with Date index and one column 'Portfolio' for actual returns.
+        port_predicted (pd.DataFrame): DataFrame with Date index and one column 'Portfolio' for predicted returns.
+    """
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(port_actual.index, port_actual['Portfolio'], label='Actual Portfolio Return', linestyle='--', color='blue')
+    plt.plot(port_predicted.index, port_predicted['Portfolio'], label='Predicted Portfolio Return', linestyle='-', color='orange')
+
+    plt.xlabel('Date')
+    plt.ylabel('Return')
+    plt.title('Actual vs Predicted Portfolio Returns')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+plot_portfolio_returns(actual_port, pred_port)
